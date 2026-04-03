@@ -14,7 +14,6 @@
 
 #define TAG "NetherBuildLimit"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 static const char* LOG_PATH = "/storage/emulated/0/games/NetherBuildLimit/logs/mod.log";
 
@@ -43,7 +42,7 @@ static inline void unpack_range(int32_t v, int16_t& out_max, int16_t& out_min) {
     out_min = (int16_t)(v & 0xFFFF);
 }
 
-static uint8_t* trampoline    = nullptr;
+static uint8_t* trampoline     = nullptr;
 static bool     hook_installed = false;
 
 static void write_abs_jump(uint8_t* dst, uintptr_t target_addr) {
@@ -241,6 +240,8 @@ static uintptr_t find_target_function() {
 }
 
 static void do_init() {
+    if (hook_installed) return;
+
     ensure_log_dir();
     write_log("NetherBuildLimit loading...");
 
