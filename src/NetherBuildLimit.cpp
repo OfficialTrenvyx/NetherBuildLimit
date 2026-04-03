@@ -12,8 +12,10 @@
 #include <link.h>
 #include <unistd.h>
 
+#include "Gloss.h"
+
 #define TAG "NetherBuildLimit"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
 static const char* LOG_PATH = "/storage/emulated/0/games/NetherBuildLimit/logs/mod.log";
 
@@ -42,37 +44,13 @@ static inline void unpack_range(int32_t v, int16_t& out_max, int16_t& out_min) {
     out_min = (int16_t)(v & 0xFFFF);
 }
 
-static uint8_t* trampoline     = nullptr;
-static bool     hook_installed = false;
-
-static void write_abs_jump(uint8_t* dst, uintptr_t target_addr) {
-    uint32_t ldr = 0x58000051;
-    uint32_t br  = 0xD61F0220;
-    memcpy(dst + 0, &ldr, 4);
-    memcpy(dst + 4, &br,  4);
-    memcpy(dst + 8, &target_addr, 8);
-}
-
-static bool make_writable(uintptr_t addr, size_t size) {
-    long page = sysconf(_SC_PAGESIZE);
-    uintptr_t aligned = addr & ~(page - 1);
-    return mprotect(reinterpret_cast<void*>(aligned), size + page,
-                    PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
-}
-
-static bool make_rx(uintptr_t addr, size_t size) {
-    long page = sysconf(_SC_PAGESIZE);
-    uintptr_t aligned = addr & ~(page - 1);
-    return mprotect(reinterpret_cast<void*>(aligned), size + page,
-                    PROT_READ | PROT_EXEC) == 0;
-}
+static bool hook_installed = false;
+static void* original_fn   = nullptr;
 
 using OrigFn = int64_t(*)(void*, void*,
     void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*,
     void*, void*, void*, void*, void*, void*);
-
-static OrigFn call_original = nullptr;
 
 static int64_t hooked_fn(void* a, void* b,
     void* c1,  void* c2,  void* c3,  void* c4,
@@ -107,49 +85,9 @@ static int64_t hooked_fn(void* a, void* b,
             }
         }
     }
-    return call_original(a, b, c1, c2, c3, c4, c5, c6, c7, c8,
-                         c9, c10, c11, c12, c13, c14, c15, c16, c17, c18);
-}
-
-static bool install_hook(uintptr_t fn_addr) {
-    if (hook_installed) return true;
-
-    trampoline = reinterpret_cast<uint8_t*>(
-        mmap(nullptr, 32,
-             PROT_READ | PROT_WRITE | PROT_EXEC,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (trampoline == MAP_FAILED) {
-        write_log("mmap trampoline failed");
-        trampoline = nullptr;
-        return false;
-    }
-
-    memcpy(trampoline, reinterpret_cast<void*>(fn_addr), 16);
-    write_abs_jump(trampoline + 16, fn_addr + 16);
-
-    __builtin___clear_cache(
-        reinterpret_cast<char*>(trampoline),
-        reinterpret_cast<char*>(trampoline + 32));
-
-    call_original = reinterpret_cast<OrigFn>(trampoline);
-
-    if (!make_writable(fn_addr, 16)) {
-        write_log("mprotect target failed");
-        return false;
-    }
-
-    write_abs_jump(reinterpret_cast<uint8_t*>(fn_addr),
-                   reinterpret_cast<uintptr_t>(hooked_fn));
-
-    __builtin___clear_cache(
-        reinterpret_cast<char*>(fn_addr),
-        reinterpret_cast<char*>(fn_addr + 16));
-
-    make_rx(fn_addr, 16);
-
-    hook_installed = true;
-    write_log("Hook installed successfully");
-    return true;
+    return reinterpret_cast<OrigFn>(original_fn)(
+        a, b, c1, c2, c3, c4, c5, c6, c7, c8,
+        c9, c10, c11, c12, c13, c14, c15, c16, c17, c18);
 }
 
 struct TextRange { uintptr_t start; size_t size; };
@@ -251,11 +189,21 @@ static void do_init() {
         return;
     }
 
-    if (!install_hook(fn_addr)) {
-        write_log("FAILED: hook installation failed");
+    int result = GlossHook(
+        reinterpret_cast<void*>(fn_addr),
+        reinterpret_cast<void*>(hooked_fn),
+        &original_fn
+    );
+
+    if (result != 0) {
+        std::ostringstream oss;
+        oss << "GlossHook failed with code: " << result;
+        write_log(oss.str());
         return;
     }
 
+    hook_installed = true;
+    write_log("Hook installed successfully");
     write_log("Done!");
 }
 
@@ -270,3 +218,4 @@ JNI_OnLoad(JavaVM*, void*) {
 
 extern "C"
 void mod_init() { do_init(); }
+
