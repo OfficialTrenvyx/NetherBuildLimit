@@ -6,11 +6,11 @@
 #include <cstring>
 #include <vector>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <android/log.h>
 #include <dlfcn.h>
 #include <link.h>
-
-#include "Gloss.h"
+#include <unistd.h>
 
 #define TAG "NetherBuildLimit"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -43,7 +43,48 @@ static inline void unpack_range(int32_t v, int16_t& out_max, int16_t& out_min) {
     out_min = (int16_t)(v & 0xFFFF);
 }
 
-static void* original_fn = nullptr;
+// ── Trampoline ───────────────────────────────────────────────────────────────
+// We save the first 16 bytes (4 instructions) of the target function,
+// then write an absolute jump to our hook. The trampoline lets us call
+// the original function after patching.
+
+static uint8_t  trampoline[32];   // saved instructions + jump back
+static bool     hook_installed = false;
+
+// Absolute jump sequence for AArch64 (16 bytes):
+// LDR X17, #8        ; load address from next 8 bytes
+// BR  X17            ; branch to it
+// <8-byte address>
+static void write_abs_jump(uint8_t* dst, uintptr_t target_addr) {
+    uint32_t ldr = 0x58000051; // LDR X17, #8
+    uint32_t br  = 0xD61F0220; // BR X17
+    memcpy(dst + 0, &ldr, 4);
+    memcpy(dst + 4, &br,  4);
+    memcpy(dst + 8, &target_addr, 8);
+}
+
+static bool make_writable(uintptr_t addr, size_t size) {
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t aligned = addr & ~(page - 1);
+    return mprotect(reinterpret_cast<void*>(aligned), size + page,
+                    PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+}
+
+static bool make_rx(uintptr_t addr, size_t size) {
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t aligned = addr & ~(page - 1);
+    return mprotect(reinterpret_cast<void*>(aligned), size + page,
+                    PROT_READ | PROT_EXEC) == 0;
+}
+
+// ── Hook callback ────────────────────────────────────────────────────────────
+
+using OrigFn = int64_t(*)(void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*,
+    void*, void*, void*, void*, void*, void*);
+
+static OrigFn call_original = nullptr;
 
 static int64_t hooked_fn(void* a, void* b,
     void* c1,  void* c2,  void* c3,  void* c4,
@@ -58,14 +99,13 @@ static int64_t hooked_fn(void* a, void* b,
 
         char name_buf[16] = {};
         memcpy(name_buf,
-               reinterpret_cast<const uint8_t*>(range_ptr) + 4,
-               15);
+               reinterpret_cast<const uint8_t*>(range_ptr) + 4, 15);
 
         char clean[16] = {};
         int ci = 0;
         for (int i = 0; i < 15 && name_buf[i] != '\0'; i++) {
-            unsigned char c = (unsigned char)name_buf[i];
-            if (c >= 32) clean[ci++] = name_buf[i];
+            if ((unsigned char)name_buf[i] >= 32)
+                clean[ci++] = name_buf[i];
         }
 
         if (strcmp(clean, "Nether") == 0) {
@@ -74,30 +114,66 @@ static int64_t hooked_fn(void* a, void* b,
             if (cur_max != 256) {
                 *range_ptr = pack_range(256, cur_min);
                 std::ostringstream oss;
-                oss << "Nether build limit changed: " << cur_max << " -> 256";
+                oss << "Nether build limit: " << cur_max << " -> 256";
                 write_log(oss.str());
             }
         }
     }
-
-    using FnType = int64_t(*)(void*, void*,
-        void*, void*, void*, void*, void*, void*,
-        void*, void*, void*, void*, void*, void*,
-        void*, void*, void*, void*, void*, void*);
-    return reinterpret_cast<FnType>(original_fn)(
-        a, b, c1, c2, c3, c4, c5, c6, c7, c8,
-        c9, c10, c11, c12, c13, c14, c15, c16, c17, c18);
+    return call_original(a, b, c1, c2, c3, c4, c5, c6, c7, c8,
+                         c9, c10, c11, c12, c13, c14, c15, c16, c17, c18);
 }
+
+// ── Install hook ─────────────────────────────────────────────────────────────
+
+static bool install_hook(uintptr_t fn_addr) {
+    if (hook_installed) return true;
+
+    // Save original 16 bytes into trampoline
+    memcpy(trampoline, reinterpret_cast<void*>(fn_addr), 16);
+
+    // Write jump back (after the 16 saved bytes) to fn_addr+16
+    write_abs_jump(trampoline + 16, fn_addr + 16);
+
+    // Make trampoline executable
+    if (!make_writable(reinterpret_cast<uintptr_t>(trampoline), 32)) {
+        write_log("mprotect trampoline failed");
+        return false;
+    }
+    make_rx(reinterpret_cast<uintptr_t>(trampoline), 32);
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(trampoline),
+        reinterpret_cast<char*>(trampoline + 32));
+
+    call_original = reinterpret_cast<OrigFn>(trampoline);
+
+    // Patch target function: write jump to hooked_fn
+    if (!make_writable(fn_addr, 16)) {
+        write_log("mprotect target failed");
+        return false;
+    }
+
+    write_abs_jump(reinterpret_cast<uint8_t*>(fn_addr),
+                   reinterpret_cast<uintptr_t>(hooked_fn));
+
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(fn_addr),
+        reinterpret_cast<char*>(fn_addr + 16));
+
+    make_rx(fn_addr, 16);
+
+    hook_installed = true;
+    write_log("Hook installed via inline patch");
+    return true;
+}
+
+// ── Scanner ──────────────────────────────────────────────────────────────────
 
 struct TextRange { uintptr_t start; size_t size; };
 
 static TextRange get_text_section() {
     TextRange result = {0, 0};
     void* handle = dlopen("libminecraftpe.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (!handle) {
-        write_log("dlopen failed");
-        return result;
-    }
+    if (!handle) { write_log("dlopen failed"); return result; }
 
     struct Ctx { void* handle; uintptr_t start; size_t size; };
     Ctx ctx = { handle, 0, 0 };
@@ -106,10 +182,7 @@ static TextRange get_text_section() {
         auto* ctx = reinterpret_cast<Ctx*>(data);
         if (!info->dlpi_name) return 0;
         void* h = dlopen(info->dlpi_name, RTLD_LAZY | RTLD_NOLOAD);
-        if (!h || h != ctx->handle) {
-            if (h) dlclose(h);
-            return 0;
-        }
+        if (!h || h != ctx->handle) { if (h) dlclose(h); return 0; }
         dlclose(h);
         for (int i = 0; i < info->dlpi_phnum; i++) {
             auto& ph = info->dlpi_phdr[i];
@@ -134,7 +207,6 @@ static uintptr_t find_target_function() {
         write_log("Failed to get .text section");
         return 0;
     }
-
     write_log("Scanning .text section...");
 
     const uint32_t* code = reinterpret_cast<const uint32_t*>(text.start);
@@ -144,7 +216,6 @@ static uintptr_t find_target_function() {
     uintptr_t last_pos  = 0;
     uintptr_t cap_addr  = 0;
     size_t closest_dist = SIZE_MAX;
-
     std::vector<uintptr_t> fn_starts;
 
     for (size_t i = 0; i < count; i++) {
@@ -170,26 +241,21 @@ static uintptr_t find_target_function() {
         }
     }
 
-    if (!cap_addr) {
-        write_log("Pattern not found");
-        return 0;
-    }
+    if (!cap_addr) { write_log("Pattern not found"); return 0; }
 
     uintptr_t best = 0;
-    for (uintptr_t s : fn_starts) {
+    for (uintptr_t s : fn_starts)
         if (s < cap_addr && s > best) best = s;
-    }
 
-    if (!best) {
-        write_log("Function start not found");
-        return 0;
-    }
+    if (!best) { write_log("Function start not found"); return 0; }
 
     std::ostringstream oss;
     oss << "Target function at 0x" << std::hex << best;
     write_log(oss.str());
     return best;
 }
+
+// ── Entry points ─────────────────────────────────────────────────────────────
 
 static void do_init() {
     ensure_log_dir();
@@ -201,19 +267,16 @@ static void do_init() {
         return;
     }
 
-    GlossHook(
-        reinterpret_cast<void*>(fn_addr),
-        reinterpret_cast<void*>(hooked_fn),
-        &original_fn
-    );
+    if (!install_hook(fn_addr)) {
+        write_log("FAILED: hook installation failed");
+        return;
+    }
 
-    write_log("Hook installed successfully");
+    write_log("Done!");
 }
 
 extern "C" __attribute__((constructor))
-void lib_constructor() {
-    do_init();
-}
+void lib_constructor() { do_init(); }
 
 extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM*, void*) {
@@ -222,7 +285,5 @@ JNI_OnLoad(JavaVM*, void*) {
 }
 
 extern "C"
-void mod_init() {
-    do_init();
-}
+void mod_init() { do_init(); }
 
