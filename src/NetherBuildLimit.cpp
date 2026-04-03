@@ -43,21 +43,12 @@ static inline void unpack_range(int32_t v, int16_t& out_max, int16_t& out_min) {
     out_min = (int16_t)(v & 0xFFFF);
 }
 
-// ── Trampoline ───────────────────────────────────────────────────────────────
-// We save the first 16 bytes (4 instructions) of the target function,
-// then write an absolute jump to our hook. The trampoline lets us call
-// the original function after patching.
-
-static uint8_t  trampoline[32];   // saved instructions + jump back
+static uint8_t* trampoline    = nullptr;
 static bool     hook_installed = false;
 
-// Absolute jump sequence for AArch64 (16 bytes):
-// LDR X17, #8        ; load address from next 8 bytes
-// BR  X17            ; branch to it
-// <8-byte address>
 static void write_abs_jump(uint8_t* dst, uintptr_t target_addr) {
-    uint32_t ldr = 0x58000051; // LDR X17, #8
-    uint32_t br  = 0xD61F0220; // BR X17
+    uint32_t ldr = 0x58000051;
+    uint32_t br  = 0xD61F0220;
     memcpy(dst + 0, &ldr, 4);
     memcpy(dst + 4, &br,  4);
     memcpy(dst + 8, &target_addr, 8);
@@ -76,8 +67,6 @@ static bool make_rx(uintptr_t addr, size_t size) {
     return mprotect(reinterpret_cast<void*>(aligned), size + page,
                     PROT_READ | PROT_EXEC) == 0;
 }
-
-// ── Hook callback ────────────────────────────────────────────────────────────
 
 using OrigFn = int64_t(*)(void*, void*,
     void*, void*, void*, void*, void*, void*,
@@ -123,30 +112,28 @@ static int64_t hooked_fn(void* a, void* b,
                          c9, c10, c11, c12, c13, c14, c15, c16, c17, c18);
 }
 
-// ── Install hook ─────────────────────────────────────────────────────────────
-
 static bool install_hook(uintptr_t fn_addr) {
     if (hook_installed) return true;
 
-    // Save original 16 bytes into trampoline
-    memcpy(trampoline, reinterpret_cast<void*>(fn_addr), 16);
-
-    // Write jump back (after the 16 saved bytes) to fn_addr+16
-    write_abs_jump(trampoline + 16, fn_addr + 16);
-
-    // Make trampoline executable
-    if (!make_writable(reinterpret_cast<uintptr_t>(trampoline), 32)) {
-        write_log("mprotect trampoline failed");
+    trampoline = reinterpret_cast<uint8_t*>(
+        mmap(nullptr, 32,
+             PROT_READ | PROT_WRITE | PROT_EXEC,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (trampoline == MAP_FAILED) {
+        write_log("mmap trampoline failed");
+        trampoline = nullptr;
         return false;
     }
-    make_rx(reinterpret_cast<uintptr_t>(trampoline), 32);
+
+    memcpy(trampoline, reinterpret_cast<void*>(fn_addr), 16);
+    write_abs_jump(trampoline + 16, fn_addr + 16);
+
     __builtin___clear_cache(
         reinterpret_cast<char*>(trampoline),
         reinterpret_cast<char*>(trampoline + 32));
 
     call_original = reinterpret_cast<OrigFn>(trampoline);
 
-    // Patch target function: write jump to hooked_fn
     if (!make_writable(fn_addr, 16)) {
         write_log("mprotect target failed");
         return false;
@@ -162,11 +149,9 @@ static bool install_hook(uintptr_t fn_addr) {
     make_rx(fn_addr, 16);
 
     hook_installed = true;
-    write_log("Hook installed via inline patch");
+    write_log("Hook installed successfully");
     return true;
 }
-
-// ── Scanner ──────────────────────────────────────────────────────────────────
 
 struct TextRange { uintptr_t start; size_t size; };
 
@@ -255,8 +240,6 @@ static uintptr_t find_target_function() {
     return best;
 }
 
-// ── Entry points ─────────────────────────────────────────────────────────────
-
 static void do_init() {
     ensure_log_dir();
     write_log("NetherBuildLimit loading...");
@@ -286,4 +269,3 @@ JNI_OnLoad(JavaVM*, void*) {
 
 extern "C"
 void mod_init() { do_init(); }
-
