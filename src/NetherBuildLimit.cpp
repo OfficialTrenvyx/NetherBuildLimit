@@ -183,22 +183,24 @@ static void do_init() {
     ensure_log_dir();
     write_log("NetherBuildLimit loading...");
 
+    // GlossInit must be called before GlossHook
+    GlossInit(true);
+    write_log("GlossInit done");
+
     uintptr_t fn_addr = find_target_function();
     if (!fn_addr) {
         write_log("FAILED: target function not found");
         return;
     }
 
-    int result = GlossHook(
+    void* hook_handle = GlossHook(
         reinterpret_cast<void*>(fn_addr),
         reinterpret_cast<void*>(hooked_fn),
         &original_fn
     );
 
-    if (result != 0) {
-        std::ostringstream oss;
-        oss << "GlossHook failed with code: " << result;
-        write_log(oss.str());
+    if (!hook_handle) {
+        write_log("GlossHook failed");
         return;
     }
 
